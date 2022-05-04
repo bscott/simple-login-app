@@ -12,7 +12,7 @@ from app.models import Alias, Contact, User, Mailbox
 
 
 class UnsubscribeEncoder:
-    
+
 
 class UnsubscribeHandler:
 
