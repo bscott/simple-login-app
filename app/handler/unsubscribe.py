@@ -1,21 +1,53 @@
 from email.message import Message
-from typing import Optional
 
 from aiosmtpd.smtp import Envelope
 
 from app.config import URL
 from app.db import Session
 from app.email import headers, status
-from app.email_utils import send_email, render
+from app.email_utils import send_email, render, add_or_replace_header
 from app.log import LOG
 from app.models import Alias, Contact, User, Mailbox
 
 
-class UnsubscribeEncoder:
+class UnsubscribeGenerator:
+    def _generate_header_with_original_behaviour(self, message: Message) -> Message:
+        unsubscribe_data = message[headers.LIST_UNSUBSCRIBE]
+        if not unsubscribe_data:
+            return message
+
+    def _generate_header_with_sl_behaviour(
+        self, alias: Alias, contact: Contact, message: Message
+    ) -> Message:
+        user = alias.user
+        if user.one_click_unsubscribe_block_sender:
+            unsubscribe_link, via_email = alias.unsubscribe_link(contact)
+        else:
+            unsubscribe_link, via_email = alias.unsubscribe_link()
+
+        add_or_replace_header(
+            message, headers.LIST_UNSUBSCRIBE, f"<{unsubscribe_link}>"
+        )
+        if not via_email:
+            add_or_replace_header(
+                message, headers.LIST_UNSUBSCRIBE_POST, "List-Unsubscribe=One-Click"
+            )
+        return message
+
+    def add_header_to_message(
+        self, alias: Alias, contact: Contact, message: Message
+    ) -> Message:
+        """
+        Add List-Unsubscribe header
+        """
+        user = alias.user
+        if user.setting:
+            return self._generate_header_with_original_behaviour(message)
+        else:
+            return self._generate_header_with_sl_behaviour(alias, contact, message)
 
 
 class UnsubscribeHandler:
-
     def _unsubscribe_user_from_newsletter(self, user_id: int, mail_from: str) -> str:
         """return the SMTP status"""
         user = User.get(user_id)
@@ -45,7 +77,6 @@ class UnsubscribeHandler:
 
         return status.E202
 
-
     def handle_unsubscribe(self, envelope: Envelope, msg: Message) -> str:
         """return the SMTP status"""
         # format: alias_id:
@@ -63,7 +94,9 @@ class UnsubscribeHandler:
             # {user.id}*
             elif subject.endswith("*"):
                 user_id = int(subject[:-1])
-                return self._unsubscribe_user_from_newsletter(user_id, envelope.mail_from)
+                return self._unsubscribe_user_from_newsletter(
+                    user_id, envelope.mail_from
+                )
             # some email providers might strip off the = suffix
             else:
                 alias_id = int(subject)
@@ -104,7 +137,6 @@ class UnsubscribeHandler:
             )
         return status.E202
 
-
     def _disable_contact(self, contact_id: int, envelope: Envelope) -> str:
         contact = Contact.get(contact_id)
         if not contact:
@@ -119,8 +151,8 @@ class UnsubscribeHandler:
         contact.block_forward = True
         Session.commit()
         unblock_contact_url = (
-                URL
-                + f"/dashboard/alias_contact_manager/{alias.id}?highlight_contact_id={contact.id}"
+            URL
+            + f"/dashboard/alias_contact_manager/{alias.id}?highlight_contact_id={contact.id}"
         )
         for mailbox in alias.mailboxes:
             send_email(
@@ -138,7 +170,7 @@ class UnsubscribeHandler:
         return status.E202
 
     def _check_email_is_authorized_for_alias(email_address: str, alias: Alias) -> bool:
-        """ return if the email_address is authorized to unsubscribe from an alias or block a contact
+        """return if the email_address is authorized to unsubscribe from an alias or block a contact
         Usually the mail_from=mailbox.email but it can also be one of the authorized address
         """
         for mailbox in alias.mailboxes:

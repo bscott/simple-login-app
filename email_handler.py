@@ -142,7 +142,7 @@ from app.handler.provider_complaint import (
     handle_hotmail_complaint,
     handle_yahoo_complaint,
 )
-from app.handler.unsubscribe import handle_unsubscribe
+from app.handler.unsubscribe import UnsubscribeHandler, UnsubscribeGenerator
 from app.log import LOG, set_message_id
 from app.mail_sender import sl_sendmail
 from app.message_utils import message_to_bytes
@@ -881,16 +881,7 @@ def forward_email_to_mailbox(
     add_alias_to_header_if_needed(msg, alias)
 
     # add List-Unsubscribe header
-    if user.one_click_unsubscribe_block_sender:
-        unsubscribe_link, via_email = alias.unsubscribe_link(contact)
-    else:
-        unsubscribe_link, via_email = alias.unsubscribe_link()
-
-    add_or_replace_header(msg, headers.LIST_UNSUBSCRIBE, f"<{unsubscribe_link}>")
-    if not via_email:
-        add_or_replace_header(
-            msg, headers.LIST_UNSUBSCRIBE_POST, "List-Unsubscribe=One-Click"
-        )
+    msg = UnsubscribeGenerator().add_header_to_message(alias, contact, msg)
 
     add_dkim_signature(msg, EMAIL_DOMAIN)
 
@@ -1737,8 +1728,6 @@ def is_bounce(envelope: Envelope, msg: Message):
     )
 
 
-
-
 def handle_transactional_bounce(
     envelope: Envelope, msg, rcpt_to, transactional_id=None
 ):
@@ -1936,7 +1925,7 @@ def handle(envelope: Envelope, msg: Message) -> str:
     # unsubscribe request
     if UNSUBSCRIBER and (rcpt_tos == [UNSUBSCRIBER] or rcpt_tos == [OLD_UNSUBSCRIBER]):
         LOG.d("Handle unsubscribe request from %s", mail_from)
-        return handle_unsubscribe(envelope, msg)
+        return UnsubscribeHandler().handle_unsubscribe(envelope, msg)
 
     # region mail sent to VERP
     verp_info = get_verp_info_from_email(rcpt_tos[0])
