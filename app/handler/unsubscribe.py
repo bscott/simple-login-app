@@ -1,3 +1,4 @@
+import urllib.parse
 from email.message import Message
 
 from aiosmtpd.smtp import Envelope
@@ -15,6 +16,20 @@ class UnsubscribeGenerator:
         unsubscribe_data = message[headers.LIST_UNSUBSCRIBE]
         if not unsubscribe_data:
             return message
+        raw_methods = [ method.strip() for method in unsubscribe_data.split(",") ]
+        original_unsubscribe_methods = []
+        for raw_method in raw_methods:
+            start = raw_method.find('<')
+            end = raw_method.rfind('>')
+            if start == -1 or end == -1 or start >= end:
+                continue
+            method = raw_method[start+1:end]
+            urldata = urllib.parse.urlparse(method)
+            if urldata.scheme not in ('http', 'https', 'mailto'):
+                continue
+            original_unsubscribe_methods.append(method)
+
+
 
     def _generate_header_with_sl_behaviour(
         self, alias: Alias, contact: Contact, message: Message
