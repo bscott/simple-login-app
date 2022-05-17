@@ -25,7 +25,7 @@ legacy_test_data = [
 
 @pytest.mark.parametrize("serialized_data, expected", legacy_test_data)
 def test_decode_legacy_unsub(serialized_data, expected):
-    info = UnsubscribeEncoder.decode_unsubscribe_payload(serialized_data)
+    info = UnsubscribeEncoder.decode(serialized_data)
     assert expected == info
 
 
@@ -35,19 +35,15 @@ encode_decode_test_data = [
     UnsubscribeData(UnsubscribeAction.DisableAlias, 101),
     UnsubscribeData(
         UnsubscribeAction.OriginalUnsubscribeMailto,
-        [("a@b.com", "some subject goes here")],
-    ),
-    UnsubscribeData(
-        UnsubscribeAction.OriginalUnsubscribeMailto,
-        [("a@b.com", "some other"), ("b@c.d", "More")],
+        (323, "a@b.com", "some subject goes here"),
     ),
 ]
 
 
 @pytest.mark.parametrize("unsub_data", encode_decode_test_data)
 def test_encode_decode_unsub(unsub_data):
-    encoded = UnsubscribeEncoder.encode_unsubscribe_data(unsub_data)
-    decoded = UnsubscribeEncoder.decode_unsubscribe_payload(encoded)
+    encoded = UnsubscribeEncoder.encode(unsub_data)
+    decoded = UnsubscribeEncoder.decode(encoded)
     assert unsub_data.action == decoded.action
     assert unsub_data.data == decoded.data
 
@@ -73,20 +69,21 @@ def generate_unsub_test_original_unsub_data() -> Iterable:
         alias,
         contact,
         True,
-        "<http://lol.com>, <mailto:somewhere@not.net>",
-        "<http://lol.com>",
+        "<https://lol.com>, <mailto:somewhere@not.net>",
+        "<https://lol.com>",
     )
     yield (
         user,
         alias,
         contact,
         False,
-        "<http://lol.com>, <mailto:somewhere@not.net>",
-        "<http://lol.com>",
+        "<https://lol.com>, <mailto:somewhere@not.net>",
+        "<https://lol.com>",
     )
-    unsub_data = UnsubscribeEncoder.encode_unsubscribe_data(
+    unsub_data = UnsubscribeEncoder.encode(
         UnsubscribeData(
-            UnsubscribeAction.OriginalUnsubscribeMailto, ["test@test.com", "hello"]
+            UnsubscribeAction.OriginalUnsubscribeMailto,
+            (alias.id, "test@test.com", "hello"),
         )
     )
     yield (
@@ -95,7 +92,7 @@ def generate_unsub_test_original_unsub_data() -> Iterable:
         contact,
         True,
         "<mailto:test@test.com?subject=hello>",
-        f"<{TEST_UNSUB_EMAIL}?subject={unsub_data}",
+        f"<mailto:{TEST_UNSUB_EMAIL}?subject={unsub_data}>",
     )
     yield (
         user,
@@ -103,24 +100,26 @@ def generate_unsub_test_original_unsub_data() -> Iterable:
         contact,
         False,
         "<mailto:test@test.com?subject=hello>",
-        f"<{URL}/dashboard/unsubscribe?request={unsub_data}",
+        f"<{URL}/dashboard/unsubscribe?request={unsub_data}>",
     )
     yield (user, alias, contact, True, None, None)
     yield (user, alias, contact, False, None, None)
 
 
 @pytest.mark.parametrize(
-    "user, alias, contact, unsub_mailto, original_header, expected_header",
+    "user, alias, contact, unsub_via_mail, original_header, expected_header",
     generate_unsub_test_original_unsub_data(),
 )
 def test_generate_unsub_header(
-    user, alias, contact, unsub_mailto, original_header, expected_header
+    user, alias, contact, unsub_via_mail, original_header, expected_header
 ):
     message = Message()
     message[headers.LIST_UNSUBSCRIBE] = original_header
-    message = UnsubscribeGenerator.add_header_to_message(message)
-    if unsub_mailto:
+    message = UnsubscribeGenerator(
+        TEST_UNSUB_EMAIL if unsub_via_mail else None
+    ).add_header_to_message(alias, contact, message)
+    assert expected_header == message[headers.LIST_UNSUBSCRIBE]
+    if not expected_header or expected_header.find("<http") == -1:
         assert message[headers.LIST_UNSUBSCRIBE_POST] is None
     else:
         assert "List-Unsubscribe=One-Click" == message[headers.LIST_UNSUBSCRIBE_POST]
-    assert expected_header == message[headers.LIST_UNSUBSCRIBE]
