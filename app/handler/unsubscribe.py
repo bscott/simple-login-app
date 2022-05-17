@@ -54,20 +54,26 @@ class UnsubscribeEncoder:
     @classmethod
     def decode(cls, data: str) -> Optional[UnsubscribeData]:
         if data.find(UNSUB_PREFIX) == -1:
-            # subject has the format {alias.id}=
-            if data.endswith("="):
-                alias_id = int(data[:-1])
-                return UnsubscribeData(UnsubscribeAction.DisableAlias, alias_id)
-            # {contact.id}_
-            elif data.endswith("_"):
-                contact_id = int(data[:-1])
-                return UnsubscribeData(UnsubscribeAction.DisableContact, contact_id)
-            # {user.id}*
-            elif data.endswith("*"):
-                user_id = int(data[:-1])
-                return UnsubscribeData(UnsubscribeAction.UnsubscribeNewsletter, user_id)
-            else:
-                LOG.info(f"Invalid unsubscribe data: {data}")
+            try:
+                # subject has the format {alias.id}=
+                if data.endswith("="):
+                    alias_id = int(data[:-1])
+                    return UnsubscribeData(UnsubscribeAction.DisableAlias, alias_id)
+                # {contact.id}_
+                elif data.endswith("_"):
+                    contact_id = int(data[:-1])
+                    return UnsubscribeData(UnsubscribeAction.DisableContact, contact_id)
+                # {user.id}*
+                elif data.endswith("*"):
+                    user_id = int(data[:-1])
+                    return UnsubscribeData(
+                        UnsubscribeAction.UnsubscribeNewsletter, user_id
+                    )
+                else:
+                    # some email providers might strip off the = suffix
+                    alias_id = int(data)
+                    return UnsubscribeData(UnsubscribeAction.DisableAlias, alias_id)
+            except ValueError:
                 return None
         signer = cls._get_signer()
         try:
@@ -176,69 +182,39 @@ class UnsubscribeGenerator:
 
 
 class UnsubscribeHandler:
-    def _unsubscribe_user_from_newsletter(self, user_id: int, mail_from: str) -> str:
-        """return the SMTP status"""
-        user = User.get(user_id)
-        if not user:
-            LOG.w("No such user %s %s", user_id, mail_from)
-            return status.E510
+    def _extract_unsub_info_from_message(
+        self, message: Message
+    ) -> Optional[UnsubscribeData]:
+        header_value = message[headers.SUBJECT]
+        if not header_value:
+            return None
+        return UnsubscribeEncoder.decode(header_value)
 
-        if mail_from != user.email:
-            LOG.w("Unauthorized mail_from %s %s", user, mail_from)
-            return status.E511
-
-        user.notification = False
-        Session.commit()
-
-        send_email(
-            user.email,
-            "You have been unsubscribed from SimpleLogin newsletter",
-            render(
-                "transactional/unsubscribe-newsletter.txt",
-                user=user,
-            ),
-            render(
-                "transactional/unsubscribe-newsletter.html",
-                user=user,
-            ),
-        )
-
-        return status.E202
-
-    def handle_unsubscribe(self, envelope: Envelope, msg: Message) -> str:
-        """return the SMTP status"""
-        # format: alias_id:
-        subject = msg[headers.SUBJECT]
-
-        try:
-            # subject has the format {alias.id}=
-            if subject.endswith("="):
-                alias_id = int(subject[:-1])
-                return self._disable_alias(alias_id)
-            # {contact.id}_
-            elif subject.endswith("_"):
-                contact_id = int(subject[:-1])
-                return self._disable_contact(contact_id)
-            # {user.id}*
-            elif subject.endswith("*"):
-                user_id = int(subject[:-1])
-                return self._unsubscribe_user_from_newsletter(
-                    user_id, envelope.mail_from
-                )
-            # some email providers might strip off the = suffix
-            else:
-                alias_id = int(subject)
-                return self._disable_alias(alias_id)
-        except Exception:
+    def handle_unsubscribe_from_message(self, envelope: Envelope, msg: Message) -> str:
+        unsub_data = self._extract_unsub_info_from_message(msg)
+        if not unsub_data:
             LOG.w("Wrong format subject %s", msg[headers.SUBJECT])
             return status.E507
+        if unsub_data.action == UnsubscribeAction.DisableAlias:
+            return self._disable_alias(unsub_data.data, envelope.mail_from)
+        elif unsub_data.action == UnsubscribeAction.DisableContact:
+            return self._disable_contact(unsub_data.data, envelope.mail_from)
+        elif unsub_data.action == UnsubscribeAction.UnsubscribeNewsletter:
+            return self._unsubscribe_user_from_newsletter(
+                unsub_data.data, envelope.mail_from
+            )
+        elif unsub_data.action == UnsubscribeAction.OriginalUnsubscribeMailto:
+            return self._unsubscribe_original_behaviour(
+                unsub_data.data, envelope.mail_from
+            )
+        else:
+            raise Exception(f"Unknown unsubscribe action {unsub_data.action}")
 
-    def _disable_alias(self, alias_id: int, envelope: Envelope) -> str:
+    def _disable_alias(self, alias_id: int, mail_from: str) -> str:
         alias = Alias.get(alias_id)
         if not alias:
             return status.E508
 
-        mail_from = envelope.mail_from
         # Only alias's owning mailbox can send the unsubscribe request
         if not self._check_email_is_authorized_for_alias(mail_from, alias):
             return status.E509
@@ -265,12 +241,11 @@ class UnsubscribeHandler:
             )
         return status.E202
 
-    def _disable_contact(self, contact_id: int, envelope: Envelope) -> str:
+    def _disable_contact(self, contact_id: int, mail_from: str) -> str:
         contact = Contact.get(contact_id)
         if not contact:
             return status.E508
 
-        mail_from = envelope.mail_from
         # Only alias's owning mailbox can send the unsubscribe request
         if not self._check_email_is_authorized_for_alias(mail_from, contact.alias):
             return status.E509
@@ -294,6 +269,35 @@ class UnsubscribeHandler:
                     unblock_contact_url=unblock_contact_url,
                 ),
             )
+
+        return status.E202
+
+    def _unsubscribe_user_from_newsletter(self, user_id: int, mail_from: str) -> str:
+        """return the SMTP status"""
+        user = User.get(user_id)
+        if not user:
+            LOG.w("No such user %s %s", user_id, mail_from)
+            return status.E510
+
+        if mail_from != user.email:
+            LOG.w("Unauthorized mail_from %s %s", user, mail_from)
+            return status.E511
+
+        user.notification = False
+        Session.commit()
+
+        send_email(
+            user.email,
+            "You have been unsubscribed from SimpleLogin newsletter",
+            render(
+                "transactional/unsubscribe-newsletter.txt",
+                user=user,
+            ),
+            render(
+                "transactional/unsubscribe-newsletter.html",
+                user=user,
+            ),
+        )
 
         return status.E202
 
