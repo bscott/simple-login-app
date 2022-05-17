@@ -501,6 +501,11 @@ class User(Base, ModelMixin, UserMixin, PasswordOracle):
         nullable=False,
     )
 
+    # Keep original unsub behaviour
+    original_unsub = sa.Column(
+        sa.Boolean, default=True, nullable=False, server_default="1"
+    )
+
     @property
     def directory_quota(self):
         return min(

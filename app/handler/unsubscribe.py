@@ -1,35 +1,149 @@
+import base64
+import hashlib
+import hmac
+import json
 import urllib.parse
+from dataclasses import dataclass
 from email.message import Message
+from typing import List, Optional, Union, Tuple
 
+import itsdangerous
 from aiosmtpd.smtp import Envelope
 
-from app.config import URL
+from app.config import URL, UNSUBSCRIBER, UNSUBSCRIBE_SECRET
 from app.db import Session
 from app.email import headers, status
-from app.email_utils import send_email, render, add_or_replace_header
+from app.email_utils import send_email, render, add_or_replace_header, delete_header
 from app.log import LOG
-from app.models import Alias, Contact, User, Mailbox
+from app.models import Alias, Contact, User, EnumE
+
+
+UNSUB_PREFIX = "unsub"
+
+
+class UnsubscribeAction(EnumE):
+    UnsubscribeNewsletter = 1
+    DisableAlias = 2
+    DisableContact = 3
+    OriginalUnsubscribeMailto = 4
+
+
+@dataclass
+class UnsubscribeData:
+    action: UnsubscribeAction
+    data: Union[List[Tuple[str, str]], int]
+
+
+class UnsubscribeEncoder:
+    @staticmethod
+    def _get_signer() -> itsdangerous.Signer:
+        return itsdangerous.Signer(UNSUBSCRIBE_SECRET, digest_method=hashlib.sha3_224)
+
+    @staticmethod
+    def encode_unsubscribe_data(unsub: UnsubscribeData) -> str:
+        payload = (unsub.action.value, unsub.data)
+        serialized_data = (
+            base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8"))
+            .rstrip(b"=")
+            .decode("utf-8")
+        )
+        signer = itsdangerous.Signer(UNSUBSCRIBE_SECRET, digest_method=hashlib.sha3_224)
+        signed_data = signer.sign(serialized_data).decode("utf-8")
+        return f"{UNSUB_PREFIX}.{signed_data}"
+
+    @classmethod
+    def set_unsubscribe_header(
+        cls, message: Message, unsub: UnsubscribeData
+    ) -> Message:
+        unsub_payload = cls.encode_unsubscribe_data(unsub)
+        if UNSUBSCRIBER:
+            unsub_mailto = f"mailto:{UNSUBSCRIBER}?subject={unsub_payload}", True
+            add_or_replace_header(
+                message, headers.LIST_UNSUBSCRIBE, f"<{unsub_mailto}>"
+            )
+            delete_header(message, headers.LIST_UNSUBSCRIBE_POST)
+        else:
+            url = f"{URL}/dashboard/unsubscribe?request={unsub_payload}"
+            add_or_replace_header(message, headers.LIST_UNSUBSCRIBE, f"<{url}>")
+            add_or_replace_header(
+                message, headers.LIST_UNSUBSCRIBE_POST, "List-Unsubscribe=One-Click"
+            )
+        return message
+
+    @classmethod
+    def extract_from_unsubscribe_header(
+        cls, message: Message
+    ) -> Optional[UnsubscribeData]:
+        data = message[headers.LIST_UNSUBSCRIBE]
+        if not data:
+            return None
+        return cls.decode_unsubscribe_payload(data)
+
+    @classmethod
+    def decode_unsubscribe_payload(cls, data: str) -> Optional[UnsubscribeData]:
+        if data.find(UNSUB_PREFIX) == -1:
+            # subject has the format {alias.id}=
+            if data.endswith("="):
+                alias_id = int(data[:-1])
+                return UnsubscribeData(UnsubscribeAction.DisableAlias, alias_id)
+            # {contact.id}_
+            elif data.endswith("_"):
+                contact_id = int(data[:-1])
+                return UnsubscribeData(UnsubscribeAction.DisableContact, contact_id)
+            # {user.id}*
+            elif data.endswith("*"):
+                user_id = int(data[:-1])
+                return UnsubscribeData(UnsubscribeAction.UnsubscribeNewsletter, user_id)
+            else:
+                LOG.info(f"Invalid unsubscribe data: {data}")
+                return None
+        signer = cls._get_signer()
+        try:
+            verified_data = signer.unsign(data[len(UNSUB_PREFIX) + 1 :])
+        except itsdangerous.BadSignature:
+            return None
+        try:
+            padded_data = verified_data + (b"=" * (-len(verified_data) % 4))
+            payload = json.loads(base64.urlsafe_b64decode(padded_data))
+        except ValueError:
+            return None
+        action = UnsubscribeAction(payload[0])
+        action_data = payload[1]
+        if action == UnsubscribeAction.OriginalUnsubscribeMailto:
+            action_data = [tuple(mail_data) for mail_data in action_data]
+        return UnsubscribeData(action, action_data)
 
 
 class UnsubscribeGenerator:
+    def __init__(self, unsubscribe_email: Optional[str] = None):
+        self.unsubscribe_email = unsubscribe_email or UNSUBSCRIBER
+
     def _generate_header_with_original_behaviour(self, message: Message) -> Message:
         unsubscribe_data = message[headers.LIST_UNSUBSCRIBE]
         if not unsubscribe_data:
             return message
-        raw_methods = [ method.strip() for method in unsubscribe_data.split(",") ]
-        original_unsubscribe_methods = []
+        raw_methods = [method.strip() for method in unsubscribe_data.split(",")]
+        mailto_unsubs = []
+        other_unsubs = []
         for raw_method in raw_methods:
-            start = raw_method.find('<')
-            end = raw_method.rfind('>')
+            start = raw_method.find("<")
+            end = raw_method.rfind(">")
             if start == -1 or end == -1 or start >= end:
                 continue
-            method = raw_method[start+1:end]
+            method = raw_method[start + 1 : end]
             urldata = urllib.parse.urlparse(method)
-            if urldata.scheme not in ('http', 'https', 'mailto'):
-                continue
-            original_unsubscribe_methods.append(method)
-
-
+            if urldata.scheme == "mailto":
+                mailto_unsubs.append(method)
+            other_unsubs.append(method)
+        # If there are non mailto unsubscribe methods, use those in the header
+        if other_unsubs:
+            message[headers.LIST_UNSUBSCRIBE] = ", ".join(
+                [f"<{method}>" for method in other_unsubs]
+            )
+            return message
+        return UnsubscribeEncoder.set_unsubscribe_header(
+            message, UnsubscribeAction.OriginalUnsubscribeMailto, mailto_unsubs
+        )
 
     def _generate_header_with_sl_behaviour(
         self, alias: Alias, contact: Contact, message: Message
